@@ -1,0 +1,63 @@
+diff --git a/dist/src/plugins/gateway/GatewayPlugin.js b/dist/src/plugins/gateway/GatewayPlugin.js
+index c50ca2ff5d521dfeff558f9da635142b89bd0472..b63590a8c6f5c3f142f9a056c60d7e020d5615e8 100644
+--- a/dist/src/plugins/gateway/GatewayPlugin.js
++++ b/dist/src/plugins/gateway/GatewayPlugin.js
+@@ -103,6 +103,7 @@ export class GatewayPlugin extends Plugin {
+     }
+     disconnect() {
+         stopHeartbeat(this);
++        this.lastHeartbeatAck = true; // Reset so new connection's heartbeat works
+         this.monitor.resetUptime();
+         this.ws?.close();
+         this.ws = null;
+@@ -126,7 +127,9 @@ export class GatewayPlugin extends Plugin {
+         let closed = false;
+         this.ws.on("open", () => {
+             this.isConnecting = false;
+-            this.reconnectAttempts = 0;
++            // reconnectAttempts is now reset on READY/RESUMED instead of here,
++            // so that failed resumes (e.g. code 1005 loops) still count toward
++            // maxAttempts and produce increasing backoff.
+             this.emitter.emit("debug", "WebSocket connection opened");
+         });
+         this.ws.on("message", (data) => {
+@@ -202,6 +205,7 @@ export class GatewayPlugin extends Plugin {
+                             if (!this.options.eventFilter || this.options.eventFilter?.(t1)) {
+                                 if (t1 === "READY" || t1 === "RESUMED") {
+                                     this.isConnected = true;
++                                    this.reconnectAttempts = 0;
+                                 }
+                                 if (t1 === "READY") {
+                                     const readyData = d;
+@@ -329,6 +333,19 @@ export class GatewayPlugin extends Plugin {
+         if (this.reconnectTimeout || this.isConnecting) {
+             return;
+         }
++        // After 3 consecutive failed reconnect attempts with a resumable session,
++        // invalidate the session and force a fresh IDENTIFY. This prevents infinite
++        // resume loops when Discord rejects the session with code 1005.
++        const resumeFailureThreshold = 3;
++        if (this.reconnectAttempts >= resumeFailureThreshold && this.canResume()) {
++            this.emitter.emit("debug", `Session invalidated after ${this.reconnectAttempts} failed resume attempts — forcing fresh IDENTIFY`);
++            this.state.sessionId = null;
++            this.state.resumeGatewayUrl = null;
++            this.state.sequence = null;
++            this.sequence = null;
++            this.pings = [];
++            options.forceNoResume = true;
++        }
+         this.disconnect();
+         const backoffTime = Math.min(baseDelay * 2 ** this.reconnectAttempts, maxDelay);
+         this.reconnectAttempts++;
+diff --git a/dist/src/plugins/gateway/utils/heartbeat.js b/dist/src/plugins/gateway/utils/heartbeat.js
+index d842d506456cb8318f6e39097203ede6edfaa8f0..592cd78f54c726eae0f9dc6e805c9b63fe021cf0 100644
+--- a/dist/src/plugins/gateway/utils/heartbeat.js
++++ b/dist/src/plugins/gateway/utils/heartbeat.js
+@@ -1,6 +1,7 @@
+ import { GatewayOpcodes } from "../types.js";
+ export function startHeartbeat(manager, options) {
+     stopHeartbeat(manager);
++    manager.lastHeartbeatAck = true; // Reset for new connection
+     const jitter = Math.random();
+     const initialDelay = Math.floor(options.interval * jitter);
+     const interval = options.interval;
